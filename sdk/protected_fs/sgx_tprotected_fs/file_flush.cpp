@@ -29,6 +29,7 @@
  *
  */
 
+#include <vector>
 #include "sgx_tprotected_fs.h"
 #include "sgx_tprotected_fs_t.h"
 #include "protected_fs_file.h"
@@ -56,7 +57,7 @@ bool protected_fs_file::flush()
 		return false;
 	}
 	
-	result = internal_flush(true);
+	result = internal_flush();
 	if (result == false)
 	{
 		assert(file_status != SGX_FILE_STATUS_OK);
@@ -70,7 +71,7 @@ bool protected_fs_file::flush()
 }
 
 
-bool protected_fs_file::internal_flush(bool flush_to_disk)
+bool protected_fs_file::internal_flush()
 {
 	if (need_writing == false) // no changes at all
 		return true;
@@ -83,7 +84,7 @@ bool protected_fs_file::internal_flush(bool flush_to_disk)
 			return false;
 		}
 
-		if (_RECOVERY_HOOK_(1) || set_update_flag(flush_to_disk) != true)
+		if (_RECOVERY_HOOK_(1) || set_update_flag() != true)
 		{
 			file_status = SGX_FILE_STATUS_FLUSH_ERROR;
 			return false;
@@ -91,24 +92,14 @@ bool protected_fs_file::internal_flush(bool flush_to_disk)
 
 		if (_RECOVERY_HOOK_(2) || update_all_data_and_mht_nodes() != true)
 		{
-			clear_update_flag();
-			file_status = SGX_FILE_STATUS_CRYPTO_ERROR; // this is something that shouldn't happen, can't fix this...
+			file_status = SGX_FILE_STATUS_WRITE_TO_DISK_FAILED;
 			return false;
 		}
 	}
 
 	if (_RECOVERY_HOOK_(3) || update_meta_data_node() != true)
 	{
-		clear_update_flag();
-
-		file_status = SGX_FILE_STATUS_CRYPTO_ERROR; // this is something that shouldn't happen, can't fix this...
-		return false;
-	}
-
-	if (_RECOVERY_HOOK_(4) || write_all_changes_to_disk(flush_to_disk) != true)
-	{
-		file_status = SGX_FILE_STATUS_WRITE_TO_DISK_FAILED; // special case, need only to repeat write_all_changes_to_disk in order to repair it
-
+		file_status = SGX_FILE_STATUS_WRITE_TO_DISK_FAILED;
 		return false;
 	}
 
@@ -116,7 +107,7 @@ bool protected_fs_file::internal_flush(bool flush_to_disk)
 
 /* this is causing problems when we delete and create the file rapidly
    we will just leave the file, and re-write it every time
-   u_sgxprotectedfs_recovery_file_open opens it with 'w' so it is truncated
+   u_sgxprotectedfs_fwrite_recovery_file opens it with 'w' so it is truncated
 	if (encrypted_part_plain.size > MD_USER_DATA_SIZE)
 	{
 		erase_recovery_file();
@@ -129,20 +120,11 @@ bool protected_fs_file::internal_flush(bool flush_to_disk)
 
 bool protected_fs_file::write_recovery_file()
 {
-	void* recovery_file = NULL;
 	sgx_status_t status;
 	uint8_t result = 0;
-	int32_t result32 = 0;
-
-	status = u_sgxprotectedfs_recovery_file_open(&recovery_file, recovery_filename);
-	if (status != SGX_SUCCESS || recovery_file == NULL)
-	{
-		last_error = status != SGX_SUCCESS ? status : SGX_ERROR_FILE_CANT_OPEN_RECOVERY_FILE;
-		return false;
-	}
+	std::vector<uint64_t> vec;
 
 	void* data = NULL;
-	recovery_node_t* recovery_node = NULL;
 
 	for (data = cache.get_first() ; data != NULL ; data = cache.get_next())
 	{
@@ -152,7 +134,7 @@ bool protected_fs_file::write_recovery_file()
 			if (file_data_node->need_writing == false || file_data_node->new_node == true)
 				continue;
 
-			recovery_node = &file_data_node->recovery_node;
+			vec.push_back(file_data_node->physical_node_number);
 		}
 		else
 		{
@@ -161,90 +143,39 @@ bool protected_fs_file::write_recovery_file()
 			if (file_mht_node->need_writing == false || file_mht_node->new_node == true)
 				continue;
 
-			recovery_node = &file_mht_node->recovery_node;
-		}
-
-		status = u_sgxprotectedfs_fwrite_recovery_node(&result, recovery_file, (uint8_t*)recovery_node, sizeof(recovery_node_t));
-		if (status != SGX_SUCCESS || result != 0)
-		{
-			u_sgxprotectedfs_fclose(&result32, recovery_file);
-			u_sgxprotectedfs_remove(&result32, recovery_filename);
-			last_error = status != SGX_SUCCESS ? status : SGX_ERROR_FILE_CANT_WRITE_RECOVERY_FILE;
-			return false;
+			vec.push_back(file_mht_node->physical_node_number);
 		}
 	}
 
 	if (root_mht.need_writing == true && root_mht.new_node == false)
-	{
-		status = u_sgxprotectedfs_fwrite_recovery_node(&result, recovery_file, (uint8_t*)&root_mht.recovery_node, sizeof(recovery_node_t));
-		if (status != SGX_SUCCESS || result != 0)
-		{
-			u_sgxprotectedfs_fclose(&result32, recovery_file);
-			u_sgxprotectedfs_remove(&result32, recovery_filename);
-			last_error = status != SGX_SUCCESS ? status : SGX_ERROR_FILE_CANT_WRITE_RECOVERY_FILE;
-			return false;
-		}
-	}
+		vec.push_back(root_mht.physical_node_number);
 
-	status = u_sgxprotectedfs_fwrite_recovery_node(&result, recovery_file, (uint8_t*)&meta_data_recovery_node, sizeof(recovery_node_t));
+	vec.push_back(meta_data_node_number);
+
+	status = u_sgxprotectedfs_fwrite_recovery_file(&result, file_addr, recovery_filename, (uint64_t*)&vec[0], vec.size());
 	if (status != SGX_SUCCESS || result != 0)
 	{
-		u_sgxprotectedfs_fclose(&result32, recovery_file);
-		u_sgxprotectedfs_remove(&result32, recovery_filename);
 		last_error = status != SGX_SUCCESS ? status : SGX_ERROR_FILE_CANT_WRITE_RECOVERY_FILE;
 		return false;
 	}
 
-	u_sgxprotectedfs_fclose(&result32, recovery_file); // TODO - check result
-
 	return true;
 }
 
 
-bool protected_fs_file::set_update_flag(bool flush_to_disk)
+bool protected_fs_file::set_update_flag()
 {
-	sgx_status_t status;
-	uint8_t result;
-	int32_t result32;
-
-	file_meta_data.plain_part.update_flag = 1;
-	status = u_sgxprotectedfs_fwrite_node(&result32, file, 0, (uint8_t*)&file_meta_data, NODE_SIZE);
-	file_meta_data.plain_part.update_flag = 0; // turn it off in memory. at the end of the flush, when we'll write the meta-data to disk, this flag will also be cleared there.
-	if (status != SGX_SUCCESS || result32 != 0)
+	if (file_addr == NULL || real_file_size < NODE_SIZE)
 	{
-		last_error = (status != SGX_SUCCESS) ? status :
-					 (result32 != -1) ? result32 : EIO;
+		last_error = EIO;
 		return false;
 	}
 
-	if (flush_to_disk == true)
-	{
-		status = u_sgxprotectedfs_fflush(&result, file);
-		if (status != SGX_SUCCESS || result != 0)
-		{
-			last_error = status != SGX_SUCCESS ? status : SGX_ERROR_FILE_FLUSH_FAILED;
-			u_sgxprotectedfs_fwrite_node(&result32, file, 0, (uint8_t*)&file_meta_data, NODE_SIZE); // try to clear the update flag, in the OS cache at least...
-			return false;
-		}
-
-	}
+	file_meta_data.plain_part.update_flag = 1;
+	memcpy(file_addr, &file_meta_data, NODE_SIZE);
+	file_meta_data.plain_part.update_flag = 0; // turn it off in memory. at the end of the flush, when we'll write the meta-data to disk, this flag will also be cleared there.
 
 	return true;
-}
-
-
-// this function is called if we had an error after we updated the update flag
-// in normal flow, the flag is cleared when the meta-data is written to disk
-void protected_fs_file::clear_update_flag()
-{
-	uint8_t result;
-	int32_t result32;
-
-	if (_RECOVERY_HOOK_(3))
-		return;
-	assert(file_meta_data.plain_part.update_flag == 0);
-	u_sgxprotectedfs_fwrite_node(&result32, file, 0, (uint8_t*)&file_meta_data, NODE_SIZE);
-	u_sgxprotectedfs_fflush(&result, file);
 }
 
 
@@ -254,12 +185,13 @@ bool mht_order(const file_mht_node_t* first, const file_mht_node_t* second)
 	return first->mht_node_number > second->mht_node_number;
 }
 
-
-bool protected_fs_file::update_all_data_and_mht_nodes()
+bool protected_fs_file::single_thread_update_data_nodes()
 {
-	std::list<file_mht_node_t*> mht_list;
-	std::list<file_mht_node_t*>::iterator mht_list_it;
-	file_mht_node_t* file_mht_node;
+	gcm_crypto_data_t* gcm_crypto_data;
+	uint8_t* file_data_node_addr;
+	file_data_node_t* data_node;
+	file_mht_node_t* mht_node;
+	uint8_t temp_node[NODE_SIZE] = { 0 };
 	sgx_status_t status;
 	void* data = cache.get_first();
 
@@ -270,46 +202,101 @@ bool protected_fs_file::update_all_data_and_mht_nodes()
 	{
 		if (((file_data_node_t*)data)->type == FILE_DATA_NODE_TYPE) // type is in the same offset in both node types
 		{
-			file_data_node_t* data_node = (file_data_node_t*)data;
+			data_node = (file_data_node_t*)data;
 
 			if (data_node->need_writing == true)
 			{
 				if (derive_random_node_key(data_node->physical_node_number) == false)
+				{
+					memset_s(temp_node, NODE_SIZE, 0, NODE_SIZE);
 					return false;
-
-				gcm_crypto_data_t* gcm_crypto_data = &data_node->parent->plain.data_nodes_crypto[data_node->data_node_number % ATTACHED_DATA_NODES_COUNT];
-
-				// encrypt the data, this also saves the gmac of the operation in the mht crypto node
-				if(!integrity_only) {
-						status = sgx_rijndael128GCM_encrypt(&cur_key, data_node->plain.data, NODE_SIZE, data_node->encrypted.cipher,
-															empty_iv, SGX_AESGCM_IV_SIZE, NULL, 0, &gcm_crypto_data->gmac);
 				}
-				// calculate the MAC only
-				else {
-						status = sgx_rijndael128GCM_encrypt(&cur_key, NULL, 0, NULL,
-															empty_iv, SGX_AESGCM_IV_SIZE, data_node->plain.data, NODE_SIZE, &gcm_crypto_data->gmac);
-						memcpy(data_node->encrypted.cipher, data_node->plain.data, NODE_SIZE);
+
+				gcm_crypto_data = &data_node->parent->plain.data_nodes_crypto[data_node->data_node_number % ATTACHED_DATA_NODES_COUNT];
+				file_data_node_addr = file_addr + NODE_SIZE * data_node->physical_node_number;
+
+				if (!integrity_only)
+				{
+					// encrypt the data, this also saves the gmac of the operation in the mht crypto node
+					status = sgx_rijndael128GCM_encrypt(&cur_key, data_node->plain.data, NODE_SIZE, temp_node,
+														empty_iv, SGX_AESGCM_IV_SIZE, NULL, 0, &gcm_crypto_data->gmac);
 				}
+				else
+				{
+					status = sgx_rijndael128GCM_encrypt(&cur_key, NULL, 0, NULL,
+														empty_iv, SGX_AESGCM_IV_SIZE, data_node->plain.data, NODE_SIZE, &gcm_crypto_data->gmac);
+				}
+
 				if (status != SGX_SUCCESS)
 				{
+					memset_s(temp_node, NODE_SIZE, 0, NODE_SIZE);
 					last_error = status;
 					return false;
 				}
 
+				if (!integrity_only)
+					memcpy(file_data_node_addr, temp_node, NODE_SIZE);
+				else
+					memcpy(file_data_node_addr, data_node->plain.data, NODE_SIZE);
 				memcpy(gcm_crypto_data->key, cur_key, sizeof(sgx_aes_gcm_128bit_key_t)); // save the key used for this encryption
 
-				file_mht_node = data_node->parent;
+				data_node->need_writing = false;
+				data_node->new_node = false;
+
+				mht_node = data_node->parent;
 				// this loop should do nothing, add it here just to be safe
-				while (file_mht_node->mht_node_number != 0)
+				while (mht_node->mht_node_number != 0)
 				{
-					assert(file_mht_node->need_writing == true);
-					file_mht_node->need_writing = true; // just in case, for release
-					file_mht_node = file_mht_node->parent;
+					assert(mht_node->need_writing == true);
+					mht_node->need_writing = true; // just in case, for release
+					mht_node = mht_node->parent;
 				}
 			}
 		}
 		data = cache.get_next();
 	}
+
+	memset_s(temp_node, NODE_SIZE, 0, NODE_SIZE);
+	return true;
+}
+
+
+bool protected_fs_file::update_all_data_and_mht_nodes()
+{
+	std::list<file_mht_node_t*> mht_list;
+	std::list<file_mht_node_t*>::iterator mht_list_it;
+	file_mht_node_t* file_mht_node;
+	uint8_t temp_node[NODE_SIZE] = { 0 };
+	int32_t result32 = -1;
+	sgx_status_t status;
+	uint64_t max_node_number = 0;
+	void* data = cache.get_first();
+
+	// find the max physical node number and remap
+	while (data != NULL)
+	{
+		if (((file_data_node_t*)data)->type == FILE_DATA_NODE_TYPE) // type is in the same offset in both node types
+		{
+			file_data_node_t* data_node = (file_data_node_t*)data;
+			if (data_node->need_writing == true)
+				max_node_number = (max_node_number > data_node->physical_node_number) ? max_node_number : data_node->physical_node_number;
+		}
+		data = cache.get_next();
+	}
+	if ((uint64_t)real_file_size < NODE_SIZE * (max_node_number + 1))
+	{
+		status = u_sgxprotectedfs_file_remap(&result32, file_name, &file_addr, real_file_size, NODE_SIZE * (max_node_number + 1));
+		if (status != SGX_SUCCESS || result32 != 0)
+		{
+			last_error = (status != SGX_SUCCESS) ? status :
+					     (result32 != -1) ? result32 : EIO;
+			return false;
+		}
+		real_file_size = NODE_SIZE * (max_node_number + 1);
+	}
+
+	if (single_thread_update_data_nodes() == false)
+		return false;
 
 	// add all the mht nodes that needs writing to a list
 	data = cache.get_first();
@@ -335,54 +322,79 @@ bool protected_fs_file::update_all_data_and_mht_nodes()
 		file_mht_node = *mht_list_it;
 
 		gcm_crypto_data_t* gcm_crypto_data = &file_mht_node->parent->plain.mht_nodes_crypto[(file_mht_node->mht_node_number - 1) % CHILD_MHT_NODES_COUNT];
+		uint8_t* file_mht_node_addr = file_addr + NODE_SIZE * file_mht_node->physical_node_number;
 
 		if (derive_random_node_key(file_mht_node->physical_node_number) == false)
 		{
 			mht_list.clear();
+			memset_s(temp_node, NODE_SIZE, 0, NODE_SIZE);
 			return false;
 		}
-		if(!integrity_only) {
-			status = sgx_rijndael128GCM_encrypt(&cur_key, (const uint8_t*)&file_mht_node->plain, NODE_SIZE, file_mht_node->encrypted.cipher,
+
+		if (!integrity_only)
+		{
+			status = sgx_rijndael128GCM_encrypt(&cur_key, (const uint8_t*)&file_mht_node->plain, NODE_SIZE, temp_node,
 												empty_iv, SGX_AESGCM_IV_SIZE, NULL, 0, &gcm_crypto_data->gmac);
 		}
-		else {
+		else
+		{
 			status = sgx_rijndael128GCM_encrypt(&cur_key, NULL ,0, NULL,
 												empty_iv, SGX_AESGCM_IV_SIZE, (const uint8_t*)&file_mht_node->plain, NODE_SIZE, &gcm_crypto_data->gmac);
-			memcpy(file_mht_node->encrypted.cipher, (const uint8_t*)&file_mht_node->plain, NODE_SIZE);
 		}
 		if (status != SGX_SUCCESS)
 		{
 			mht_list.clear();
+			memset_s(temp_node, NODE_SIZE, 0, NODE_SIZE);
 			last_error = status;
 			return false;
 		}
 
+		if (!integrity_only)
+			memcpy(file_mht_node_addr, temp_node, NODE_SIZE);
+		else
+			memcpy(file_mht_node_addr, (const uint8_t*)&file_mht_node->plain, NODE_SIZE);
 		memcpy(gcm_crypto_data->key, cur_key, sizeof(sgx_aes_gcm_128bit_key_t)); // save the key used for this gmac
+
+		file_mht_node->need_writing = false;
+		file_mht_node->new_node = false;
 
 		mht_list.pop_front();
 	}
 
 	// update mht root gmac in the meta data node
 	if (derive_random_node_key(root_mht.physical_node_number) == false)
+	{
+		memset_s(temp_node, NODE_SIZE, 0, NODE_SIZE);
 		return false;
+	}
 
-	if(!integrity_only) {
-		status = sgx_rijndael128GCM_encrypt(&cur_key, (const uint8_t*)&root_mht.plain, NODE_SIZE, root_mht.encrypted.cipher,
+	if (!integrity_only)
+	{
+		status = sgx_rijndael128GCM_encrypt(&cur_key, (const uint8_t*)&root_mht.plain, NODE_SIZE, temp_node,
 											empty_iv, SGX_AESGCM_IV_SIZE, NULL, 0, &encrypted_part_plain.mht_gmac);
 	}
-	else {
+	else
+	{
 		status = sgx_rijndael128GCM_encrypt(&cur_key, NULL, 0, NULL,
 											empty_iv, SGX_AESGCM_IV_SIZE, (const uint8_t*)&root_mht.plain, NODE_SIZE, &encrypted_part_plain.mht_gmac);
-		memcpy(root_mht.encrypted.cipher, (const uint8_t*)&root_mht.plain, NODE_SIZE);
 	}
 	if (status != SGX_SUCCESS)
 	{
+		memset_s(temp_node, NODE_SIZE, 0, NODE_SIZE);
 		last_error = status;
 		return false;
 	}
 
+	if (!integrity_only)
+		memcpy(file_addr + NODE_SIZE, temp_node, NODE_SIZE);
+	else
+		memcpy(file_addr + NODE_SIZE, (const uint8_t*)&root_mht.plain, NODE_SIZE);
 	memcpy(&encrypted_part_plain.mht_key, cur_key, sizeof(sgx_aes_gcm_128bit_key_t)); // save the key used for this gmac
 
+	root_mht.need_writing = false;
+	root_mht.new_node = false;
+
+	memset_s(temp_node, NODE_SIZE, 0, NODE_SIZE);
 	return true;
 }
 
@@ -398,122 +410,31 @@ bool protected_fs_file::update_meta_data_node()
 		return false;
 	}
 
-	if (!integrity_only) {
+	if (!integrity_only)
+	{
 		// encrypt meta data encrypted part, also updates the gmac in the meta data plain part
 		status = sgx_rijndael128GCM_encrypt(&cur_key,
-					(const uint8_t*)&encrypted_part_plain, sizeof(meta_data_encrypted_t), (uint8_t*)&file_meta_data.encrypted_part,
-					empty_iv, SGX_AESGCM_IV_SIZE,
-					NULL, 0,
-					&file_meta_data.plain_part.meta_data_gmac);
+											(const uint8_t*)&encrypted_part_plain, sizeof(meta_data_encrypted_t), (uint8_t*)&file_meta_data.encrypted_part,
+											empty_iv, SGX_AESGCM_IV_SIZE,
+											NULL, 0,
+											&file_meta_data.plain_part.meta_data_gmac);
 	}
-	else {
+	else
+	{
 		status = sgx_rijndael128GCM_encrypt(&cur_key,
-					NULL, 0, NULL,
-					empty_iv, SGX_AESGCM_IV_SIZE,
-					(const uint8_t*)&encrypted_part_plain, sizeof(meta_data_encrypted_t),
-					&file_meta_data.plain_part.meta_data_gmac);
+											NULL, 0, NULL,
+											empty_iv, SGX_AESGCM_IV_SIZE,
+											(const uint8_t*)&encrypted_part_plain, sizeof(meta_data_encrypted_t),
+											&file_meta_data.plain_part.meta_data_gmac);
 		memcpy((uint8_t*)&file_meta_data.encrypted_part, (const uint8_t*)&encrypted_part_plain, sizeof(meta_data_encrypted_t));
 	}
-
 	if (status != SGX_SUCCESS)
 	{
 		last_error = status;
 		return false;
 	}
 
-	return true;
-}
-
-
-bool protected_fs_file::write_all_changes_to_disk(bool flush_to_disk)
-{
-	uint8_t result;
-	int32_t result32;
-	sgx_status_t status;
-
-	if (encrypted_part_plain.size > MD_USER_DATA_SIZE && root_mht.need_writing == true)
-	{
-		void* data = NULL;
-		uint8_t* data_to_write;
-		uint64_t node_number;
-		file_data_node_t* file_data_node;
-		file_mht_node_t* file_mht_node;
-
-		for (data = cache.get_first() ; data != NULL ; data = cache.get_next())
-		{
-			file_data_node = NULL;
-			file_mht_node = NULL;
-
-			if (((file_data_node_t*)data)->type == FILE_DATA_NODE_TYPE) // type is in the same offset in both node types
-			{
-				file_data_node = (file_data_node_t*)data;
-				if (file_data_node->need_writing == false)
-					continue;
-
-				data_to_write = (uint8_t*)&file_data_node->encrypted;
-				node_number = file_data_node->physical_node_number;
-			}
-			else
-			{
-				file_mht_node = (file_mht_node_t*)data;
-				assert(file_mht_node->type == FILE_MHT_NODE_TYPE);
-				if (file_mht_node->need_writing == false)
-					continue;
-
-				data_to_write = (uint8_t*)&file_mht_node->encrypted;
-				node_number = file_mht_node->physical_node_number;
-			}
-
-			status = u_sgxprotectedfs_fwrite_node(&result32, file, node_number, data_to_write, NODE_SIZE);
-			if (status != SGX_SUCCESS || result32 != 0)
-			{
-				last_error = (status != SGX_SUCCESS) ? status :
-							 (result32 != -1) ? result32 : EIO;
-				return false;
-			}
-
-			// data written - clear the need_writing and the new_node flags (for future transactions, this node it no longer 'new' and should be written to recovery file)
-			if (file_data_node != NULL)
-			{
-				file_data_node->need_writing = false;
-				file_data_node->new_node = false;
-			}
-			else
-			{
-				file_mht_node->need_writing = false;
-				file_mht_node->new_node = false;
-			}
-
-		}
-
-		status = u_sgxprotectedfs_fwrite_node(&result32, file, 1, (uint8_t*)&root_mht.encrypted, NODE_SIZE);
-		if (status != SGX_SUCCESS || result32 != 0)
-		{
-			last_error = (status != SGX_SUCCESS) ? status :
-						 (result32 != -1) ? result32 : EIO;
-			return false;
-		}
-		root_mht.need_writing = false;
-		root_mht.new_node = false;
-	}
-
-	status = u_sgxprotectedfs_fwrite_node(&result32, file, 0, (uint8_t*)&file_meta_data, NODE_SIZE);
-	if (status != SGX_SUCCESS || result32 != 0)
-	{
-		last_error = (status != SGX_SUCCESS) ? status :
-					 (result32 != -1) ? result32 : EIO;
-		return false;
-	}
-
-	if (flush_to_disk == true)
-	{
-		status = u_sgxprotectedfs_fflush(&result, file);
-		if (status != SGX_SUCCESS || result != 0)
-		{
-			last_error = status != SGX_SUCCESS ? status : SGX_ERROR_FILE_FLUSH_FAILED;
-			return false;
-		}
-	}
+	memcpy(file_addr, &file_meta_data, NODE_SIZE);
 
 	return true;
 }

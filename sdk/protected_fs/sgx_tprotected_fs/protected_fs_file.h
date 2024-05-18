@@ -102,13 +102,7 @@ typedef struct _file_mht_node
 	struct _file_mht_node* parent;
 	bool need_writing;
 	bool new_node;
-	union {
-		struct {
-			uint64_t physical_node_number;
-			encrypted_node_t encrypted; // the actual data from the disk
-		};
-		recovery_node_t recovery_node;
-	};
+	uint64_t physical_node_number;
 	/* from here the structures are different */
 	mht_node_t plain; // decrypted data
 } file_mht_node_t;
@@ -122,13 +116,7 @@ typedef struct _file_data_node
 	file_mht_node_t* parent;
 	bool need_writing;
 	bool new_node;
-	union {
-		struct {
-			uint64_t physical_node_number;
-			encrypted_node_t encrypted; // the actual data from the disk
-		};
-		recovery_node_t recovery_node;
-	};
+	uint64_t physical_node_number;
 	/* from here the structures are different */
 	data_node_t plain; // decrypted data
 } file_data_node_t;
@@ -137,19 +125,16 @@ typedef struct _file_data_node
 class protected_fs_file
 {
 private:
-	union {
-		struct {
-			uint64_t meta_data_node_number; // for recovery purpose, so it is easy to write this node
-			meta_data_node_t file_meta_data; // actual data from disk's meta data node
-		};
-		recovery_node_t meta_data_recovery_node;
+	struct {
+		uint64_t meta_data_node_number; // for recovery purpose, so it is easy to write this node
+		meta_data_node_t file_meta_data; // actual data from disk's meta data node
 	};
 
 	meta_data_encrypted_t encrypted_part_plain; // encrypted part of meta data node, decrypted
 
 	file_mht_node_t root_mht; // the root of the mht is always needed (for files bigger than 3KB)
 
-	FILE* file; // OS's FILE pointer
+	uint8_t* file_addr; // start address of the memory mapped from file
 
 	open_mode_t open_mode;
 	uint8_t read_only;
@@ -172,6 +157,7 @@ private:
 	sgx_aes_gcm_128bit_key_t session_master_key;
 	uint32_t master_key_count;
 
+	char file_name[FULLNAME_MAX_LEN]; // used for u_sgxprotectedfs_file_remap
 	char recovery_filename[RECOVERY_FILE_MAX_LEN]; // might include full path to the file
 
 	lru_cache cache;
@@ -202,13 +188,12 @@ private:
 	file_mht_node_t* read_mht_node(uint64_t mht_node_number);
 	file_mht_node_t* append_mht_node(uint64_t mht_node_number);
 	bool write_recovery_file();
-	bool set_update_flag(bool flush_to_disk);
-	void clear_update_flag();
+	bool set_update_flag();
+	bool single_thread_update_data_nodes();
 	bool update_all_data_and_mht_nodes();
 	bool update_meta_data_node();
-	bool write_all_changes_to_disk(bool flush_to_disk);
 	void erase_recovery_file();
-	bool internal_flush(bool flush_to_disk);
+	bool internal_flush();
 
 public:
 	protected_fs_file(const char* filename, const char* mode, const sgx_aes_gcm_128bit_key_t* import_key, const sgx_aes_gcm_128bit_key_t* kdk_key, bool integrity_only, const uint32_t cache_page);
