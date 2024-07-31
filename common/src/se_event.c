@@ -34,6 +34,7 @@
 
 #include <linux/futex.h>
 #include <sys/time.h>
+#include <stdio.h>
 
 se_handle_t se_event_init(void)
 {
@@ -48,11 +49,22 @@ void se_event_destroy(se_handle_t se_event)
 
 int se_event_wait(se_handle_t se_event)
 {
+    long int ret = 0;
     if (se_event == NULL)
         return SE_MUTEX_INVALID;
 
     if (__sync_fetch_and_add((int*)se_event, -1) == 0)
-        syscall(__NR_futex, se_event, FUTEX_WAIT, -1, NULL, NULL, 0);
+        ret = syscall(__NR_futex, se_event, FUTEX_WAIT, -1, NULL, NULL, 0);
+
+    // Notes for Occlum:
+    // This futex syscall could be interrupted by SIG64 which is not registered with "SA_RESTART"
+    // and could cause se_event to be "-1" at this time.
+    // It could also be EAGAIN if se_event is waken before syscall.
+    if (ret < 0 && errno != EINTR && errno != EAGAIN)  {
+        abort();
+    }
+    // Guarantee se_event to be 0 when return.
+    __sync_val_compare_and_swap((int*)se_event, -1, 0);
 
     return SE_MUTEX_SUCCESS;
 }
@@ -62,26 +74,35 @@ int se_event_wait(se_handle_t se_event)
 */
 int se_event_wait_timeout(se_handle_t se_event, uint64_t timeout)
 {
-    if (se_event == NULL)
+    long int ret = -1;
+
+    if (se_event == NULL) {
         return SE_MUTEX_INVALID;
+    }
 
-    if(0 == timeout)
+    if (0 == timeout) {
         return se_event_wait(se_event);
-
-    if (__sync_fetch_and_add((int*)se_event, -1) == 0)
-    {
+    }
+    
+    if (__sync_fetch_and_add((int *)se_event, -1) == 0) {
         struct timespec time;
         time.tv_sec = (time_t)timeout;
         time.tv_nsec = 0;
-        syscall(__NR_futex, se_event, FUTEX_WAIT, -1, &time, NULL, 0);
-        //If the futex is exit with timeout (se_event still equal to ' -1'), the se_event value need reset to 0.
-        //Or the event wait will unworkable in next round checking "if (__sync_fetch_and_add((int*)se_event, -1) == 0)".
-        __sync_val_compare_and_swap((int*)se_event, -1, 0);
-    }
 
+        ret = syscall(__NR_futex, se_event, FUTEX_WAIT, -1, &time, NULL, 0);
+        if (ret < 0) {
+            if (errno == ETIMEDOUT || errno == EINTR || errno == EAGAIN) {
+                //If the futex is exit with timeout (se_event still equal to ' -1'), the se_event value need reset to 0.
+                __sync_val_compare_and_swap((int*)se_event, -1, 0);  
+                return SE_MUTEX_ERROR_WAIT;
+            } else {
+                fprintf(stderr, "The se_event_wait_timeout function Futex syscall failed with errno: %d\n", errno);
+                abort();
+            }
+        }
+    }
     return SE_MUTEX_SUCCESS;
 }
-
 
 int se_event_wake(se_handle_t se_event)
 {
